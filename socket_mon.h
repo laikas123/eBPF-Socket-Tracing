@@ -1,6 +1,3 @@
-#define DATA_BUFFER_SIZE 256
-#define MAX_KEYS 1000
-
 struct socket_data_t {
    int pid;
    int uid;
@@ -30,16 +27,19 @@ struct read_enter_data_t {
    int uid;
    int num_bytes;
    void* buf_ptr;
+   bool can_read;
    bool can_write;
 };
 
 
-struct data_buffer_t {
+struct read_exit_data_t {
    struct bpf_spin_lock lock;
    int pid;
    int uid;
-   int num_bytes;
-   char message[DATA_BUFFER_SIZE];
+   int num_bytes_desired;
+   int num_bytes_got;
+   char read_data[256];
+   bool can_read;
    bool can_write;
 };
 

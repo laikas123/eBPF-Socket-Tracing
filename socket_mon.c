@@ -36,7 +36,7 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
-int handle_event_read(void *ctx, void *data, size_t data_sz)
+int handle_event_socket(void *ctx, void *data, size_t data_sz)
 {
 	//convert data from buffer to struct
 	struct socket_data_t *kern_data = data;
@@ -50,8 +50,19 @@ int handle_event_read(void *ctx, void *data, size_t data_sz)
 		printf("pid = %d  uid = %d domain = %s type = %s protocol = %s\n", kern_data -> pid, kern_data -> uid, domain_str, type_str, protocol_str);
 	}
 
+	return 0;
+	
+}
 
 
+int handle_event_read(void *ctx, void *data, size_t data_sz)
+{
+	//convert data from buffer to struct
+	struct read_data_t *kern_data = data;
+
+	if(kern_data -> pid == 35128){
+		printf("pid = %d  uid = %d bytes read = %d\n", kern_data -> pid, kern_data -> uid, kern_data -> num_bytes);
+	}
 
 	return 0;
 	
@@ -206,10 +217,14 @@ const char* protocol_to_str(int protocol) {
 
 int main()
 {
+
+
     struct socket_mon_bpf *skel;
 	// struct bpf_object_open_opts *o;
     int err;
+	struct ring_buffer *rb_socket = NULL;
 	struct ring_buffer *rb_read = NULL;
+
 
 	libbpf_set_print(libbpf_print_fn);
 
@@ -249,27 +264,54 @@ int main()
         return 1;
 	}
 
+	int key = 490;
+	char* value = NULL;
+
+	
+
 	//initialize ring buffer connection
-	rb_read = ring_buffer__new(bpf_map__fd(skel->maps.output_socket), handle_event_read, NULL, NULL);
-	if (!rb_read) {
+	rb_socket = ring_buffer__new(bpf_map__fd(skel->maps.output_socket), handle_event_socket, NULL, NULL);
+	if (!rb_socket) {
 		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
+		fprintf(stderr, "Failed to create ring buffer socket\n");
 		socket_mon_bpf__destroy(skel);
         return 1;
 	}
 
+	rb_read = ring_buffer__new(bpf_map__fd(skel->maps.output_read), handle_event_read, NULL, NULL);
+	if (!rb_read) {
+		err = -1;
+		fprintf(stderr, "Failed to create ring buffer read\n");
+		socket_mon_bpf__destroy(skel);
+        return 1;
+	}
+
+
+
 	//poll the ring buffer repeatedly
 	while (true) {
+		err = ring_buffer__poll(rb_socket, 100 /* timeout, ms */);
+		// Ctrl-C gives -EINTR
+		if (err == -EINTR) {
+			err = 0;
+			break;
+		}
+
 		err = ring_buffer__poll(rb_read, 100 /* timeout, ms */);
 		// Ctrl-C gives -EINTR
 		if (err == -EINTR) {
 			err = 0;
 			break;
 		}
-		
+
+		bpf_map__lookup_elem(skel->maps.pass_buf, &key, sizeof(key), &value, sizeof(value), 0);
+
+		if(value != NULL){
+			printf("val from map = %s", value);
+		}
 	}
 
-	ring_buffer__free(rb_read);
+	ring_buffer__free(rb_socket);
 	socket_mon_bpf__destroy(skel);
 	return -err;
 }

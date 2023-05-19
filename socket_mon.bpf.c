@@ -4,8 +4,7 @@
 #include <bpf/bpf_core_read.h>
 #include "socket_mon.h"
 
-#define DATA_BUFFER_SIZE 256
-#define MAX_KEYS 1000
+
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -16,21 +15,13 @@ struct {
 
 //the only purpose of this ring buf is to let userspace know
 //that data was written to the hashmap, that way userspace can
-//poll the ringbuf rather than acquiring spinlocks on the 
-//hashamp which would slow everything down, since the ringbuf
-//holds no useful it doesn't matter if it gets polled
-//the value sent to the ringbuf is the key value
-//to read from on the hashmap
+//poll the ringbuf rather than do some complicated checks
+//on the hashmap
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1024 * 1024 /* 256 KB */);
 } output_read SEC(".maps");
 
-
-
-//THE FOLLOWING 2 MAPS ARE FIFOs WITH READ AND 
-//WRITE POINTERS, AND THEY ARE CIRCULAR SO THAT
-//THEY START BACK AT 0 ONCE MAX INDEX IS REACHED...
 
 
 
@@ -59,49 +50,27 @@ struct {
 } data_map SEC(".maps");
 
 
-long pass_read_key = 0;
-long pass_write_key = 0;
-long data_read_key = 0;
-long data_write_key = 0;
+
+//to track specific processes to prevent 
+//tracking data for every single entrance
+//to very common syscalls
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_KEYS);
+    __type(key, u32);
+    __type(value, struct socket_proc_track_struct_t);
+    // __uint(pinning, LIBBPF_PIN_BY_NAME); 
+} process_map SEC(".maps");
 
 
-void update_pass_read_key(){
-    //update pass_buf key
-    if(pass_read_key + 1 == MAX_KEYS){
-        pass_read_key = 0;
-    }else{
-        pass_read_key += 1;
-    }
-}
-
-void update_pass_write_key(){
-    //update pass_buf key
-    if(pass_write_key + 1 == MAX_KEYS){
-        pass_write_key = 0;
-    }else{
-        pass_write_key += 1;
-    }
-}
-
-
-void update_data_read_key(){
-    //update pass_buf key
-    if(data_read_key + 1 == MAX_KEYS){
-        data_read_key = 0;
-    }else{
-        data_read_key += 1;
-    }
-}
-
-void update_data_write_key(){
-    //update pass_buf key
-    if(data_write_key + 1 == MAX_KEYS){
-        data_write_key = 0;
-    }else{
-        data_write_key += 1;
-    }
-}
-
+//
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_KEYS);
+    __type(key, u32);
+    __type(value, struct fd_track_proc_struct_t);
+    // __uint(pinning, LIBBPF_PIN_BY_NAME); 
+} fd_map SEC(".maps");
 
 
 
@@ -117,6 +86,26 @@ int tp_sys_enter_socket(struct trace_event_raw_sys_enter *ctx) {
     data.type = (int) BPF_CORE_READ(ctx, args[1]);
     data.protocol = (int) BPF_CORE_READ(ctx, args[2]);
 
+    //only track rocesses by this uid, and specific socket domains
+    if(data.uid == 490 && (data.domain == AF_INET6 || data.domain == AF_INET)){
+
+        struct socket_proc_track_struct_t proc_to_track = {};
+
+        proc_to_track.pid = data.pid;
+        proc_to_track.uid = data.uid;
+        proc_to_track.reason = SOCKET_TRACK;
+    
+        
+
+
+        uint64_t pid_tgid_key = bpf_get_current_pid_tgid();
+
+        long error = bpf_map_update_elem(&process_map, &pid_tgid_key, &proc_to_track, BPF_ANY);
+        bpf_printk("error code add to process_map = %ld", error);
+
+
+    }
+
 
     //send data to buffer to be polled by userspace
     bpf_ringbuf_output(&output_socket, &data, sizeof(data), 0);   
@@ -125,68 +114,118 @@ int tp_sys_enter_socket(struct trace_event_raw_sys_enter *ctx) {
 }
 
 
-SEC("tp/syscalls/sys_enter_read")
-int tp_sys_enter_read(struct trace_event_raw_sys_enter *ctx) {
+SEC("tp/syscalls/sys_exit_socket")
+int tp_sys_exit_socket(struct trace_event_raw_sys_enter *ctx) {
     
+    uint64_t pid_tgid_key = bpf_get_current_pid_tgid();
+
+    struct socket_proc_track_struct_t *existing_proc_to_track = bpf_map_lookup_elem(&process_map, &pid_tgid_key);
+
+    int fd = (int) BPF_CORE_READ(ctx, args[0]);
+
+    //if invalid fd check if we were tracking the 
+    //process and remove it if so...
+    if(fd < 0){
+
+        if(existing_proc_to_track != NULL){
+            bpf_map_delete_elem(&process_map, &pid_tgid_key);
+        }
+        return -1;
+    }
+
+    
+
     int uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-
-    //get new data 
-    struct bpf_spin_lock new_lock = {};
-    struct read_enter_data_t new_read_enter_data = {}; 
-    new_read_enter_data.pid = bpf_get_current_pid_tgid() >> 32;
-    new_read_enter_data.uid = uid;
-    new_read_enter_data.num_bytes = (int) BPF_CORE_READ(ctx, args[2]);
-    new_read_enter_data.buf_ptr = (void*)BPF_CORE_READ(ctx, args[1]);
-    new_read_enter_data.lock = new_lock;
-    new_read_enter_data.can_read = true;
-    new_read_enter_data.can_write = false;
-
     
     if(uid == 490){
 
+        if(existing_proc_to_track == NULL){
+            return 0;
+        }
 
-        struct  read_enter_data_t *existing_read_enter_data = bpf_map_lookup_elem(&pass_buf, &pass_write_key);
+        
 
-        //first time inserting into map don't need to get spinlock
-        if(existing_read_enter_data == NULL){
-            
-            //insert into the pass map
-            long error = bpf_map_update_elem(&pass_buf, &pass_write_key, &new_read_enter_data, BPF_ANY);
-            bpf_printk("Error code for pass_buf first insert = %ld\n", error);
+        int pid = bpf_get_current_pid_tgid() >> 32;
 
-            update_pass_write_key();
+        struct fd_track_proc_struct_t *proc_with_fd = bpf_map_lookup_elem(&fd_map, &pid);
 
-        //the key exists so need to get spinlock in order to update it
+        if(proc_with_fd == NULL){
+
+            struct fd_track_proc_struct_t new_proc_with_fd = {};
+            new_proc_with_fd.pid = pid;
+            new_proc_with_fd.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+            new_proc_with_fd.fds[0] = fd;
+            new_proc_with_fd.fd_count = 1;
+            new_proc_with_fd.reason = SOCKET_TRACK;
+            long error = bpf_map_update_elem(&fd_map, &pid, &new_proc_with_fd, BPF_ANY);
+            bpf_printk("error code add to fd_map first add = %ld", error);
+
         }else{
 
-            bool done_writing = false;
-
-            //atomically update the value
-            while(done_writing == false){
-                bpf_spin_lock(&existing_read_enter_data->lock);
-                    if(existing_read_enter_data -> can_write){
-                        
-
-                        long error = bpf_map_update_elem(&pass_buf, &pass_write_key, &new_read_enter_data, BPF_ANY);
-                        bpf_printk("Error code for pass_buf existing update = %ld\n", error);
-
-                        // existing_read_enter_data -> pid = bpf_get_current_pid_tgid() >> 32;
-                        // existing_read_enter_data -> uid = uid;
-                        // existing_read_enter_data -> num_bytes = (int) BPF_CORE_READ(ctx, args[2]);
-                        // existing_read_enter_data -> buf_ptr = (void*)BPF_CORE_READ(ctx, args[1]);
-                        // existing_read_enter_data -> can_read = true;
-                        // existing_read_enter_data -> can_write = false;
-
-                        update_pass_write_key();
-
-                        done_writing = true;
-                    }
-                bpf_spin_unlock(&existing_read_enter_data->lock);
+            if(proc_with_fd -> fd_count >= MAX_FD_COUNT){
+                bpf_printk("ERROR MAX FDS REACHED FOR PROCESS WITH PID = %d", pid);
+                return 0;
+            }else{
+                int new_index = proc_with_fd -> fd_count + 1;
+                if(new_index < MAX_FD_COUNT && MAX_FD_COUNT < 5){
+                    //seems kind of weird if pid didn't match
+                    //so not gonna obsess on that...
+                    proc_with_fd -> pid = pid;
+                    proc_with_fd -> uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+                    proc_with_fd -> fds[new_index] = fd;
+                    proc_with_fd -> fd_count = proc_with_fd -> fd_count + 1;
+                    proc_with_fd -> reason = SOCKET_TRACK;
+                }else{
+                    return 0;
+                }
             }
+            
 
 
         }
+
+
         
+
+
+    }
+
+
+    return 0;
+}
+
+
+SEC("tp/syscalls/sys_enter_read")
+int tp_sys_enter_read(struct trace_event_raw_sys_enter *ctx) {
+    
+
+    //use pid_tgid as key for map because the thread
+    //is blocked until it returns from the system call
+    //so it will work out this way.
+    uint64_t pid_tgid_key = bpf_get_current_pid_tgid();
+
+    int uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+
+    //update data to insert
+    struct read_enter_data_t new_read_enter_data = {}; 
+    new_read_enter_data.pid = pid_tgid_key >> 32;
+    new_read_enter_data.uid = uid;
+    new_read_enter_data.num_bytes_desired = (int) BPF_CORE_READ(ctx, args[2]);
+    new_read_enter_data.buf_ptr = (void*)BPF_CORE_READ(ctx, args[1]);
+
+    
+
+
+    struct fd_track_proc_struct_t *tracked_proc_fd = bpf_map_lookup_elem(&fd_map, &new_read_enter_data.pid);
+
+
+
+    if(uid == 490 && tracked_proc_fd != NULL){
+        
+
+
+        long error = bpf_map_update_elem(&pass_buf, &pid_tgid_key, &new_read_enter_data, BPF_ANY);
+        // bpf_printk("desired bytes sent = %d", new_read_enter_data.num_bytes_desired);
         
     }   
 
@@ -197,127 +236,69 @@ int tp_sys_enter_read(struct trace_event_raw_sys_enter *ctx) {
 SEC("tp/syscalls/sys_exit_read")
 int tp_sys_exit_read(struct trace_event_raw_sys_enter *ctx) {
     
-    
+    //use pid_tgid as key for map because the thread
+    //is blocked until it returns from the system call
+    //so it will work out this way.
+    uint64_t pid_tgid_key = bpf_get_current_pid_tgid();
+
+    int pid = pid_tgid_key >> 32;
+
     int uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    
+    struct fd_track_proc_struct_t *tracked_proc_fd = bpf_map_lookup_elem(&fd_map, &pid);
 
-    if(uid == 490){
-       
-        //can't do anything until pass_buf has data in the correct index
-        bool found_existing_data = false;
+    if(uid == 490 && tracked_proc_fd != NULL){
 
-        struct read_enter_data_t *existing_read_enter_data;
+        struct read_enter_data_t *existing_read_enter_data = bpf_map_lookup_elem(&pass_buf, &pid_tgid_key);
+    
+        if(existing_read_enter_data != NULL){
 
-        while(found_existing_data == false){
-            //use read key
-            existing_read_enter_data = bpf_map_lookup_elem(&pass_buf, &pass_read_key);
+            //this is the return value from read, which is the number of successful
+            //bytes read, and so this is how many we still need to write to the 
+            //heap map
+            int remaining_bytes_to_write = (int) BPF_CORE_READ(ctx, args[0]);
 
-            //we only care if it does exist, 
-            if(existing_read_enter_data != NULL){
+            bpf_printk("desired bytes received = %d", existing_read_enter_data ->num_bytes_desired);
 
-                
+            //if nothing was read just return
+            if(remaining_bytes_to_write <= 0){
+                return 0;
+            }
 
-                bool done_reading = false;
+            //since we can write at most DATA_BUFFER_SIZE
+            //it will be either that or less
+            int write_amount;
 
-                //atomically read the value
-                while(done_reading == true){
-                    bpf_spin_lock(&existing_read_enter_data->lock);
-                        if(existing_read_enter_data -> can_read){
-                            
+            struct read_exit_data_t exit_dat = {};
 
-                            //since bytes can only be written 256 at a time, but read likely got
-                            //more than that, this needs to be done in increments
-                            int remaining_bytes_to_write = existing_read_enter_data -> num_bytes;
+            while(remaining_bytes_to_write > 0){
 
-                            
-
-                            while(remaining_bytes_to_write > 0){
-
-                                struct bpf_spin_lock new_lock = {};
-                                struct read_exit_data_t new_read_exit_data = {}; 
-
-                                int bytes_to_write;
-
-                                //update the read exit data
-                                new_read_exit_data.pid = existing_read_enter_data -> pid;
-                                new_read_exit_data.uid = existing_read_enter_data -> uid;
-                                new_read_exit_data.num_bytes_desired = existing_read_enter_data -> num_bytes;
-                                new_read_exit_data.num_bytes_got = (int) BPF_CORE_READ(ctx, args[0]);
-                                new_read_exit_data.lock = new_lock;
-                                new_read_exit_data.can_read = true;
-                                new_read_exit_data.can_write = false;
-
-                                if(remaining_bytes_to_write > DATA_BUFFER_SIZE){
-                                    bytes_to_write = DATA_BUFFER_SIZE;
-                                    remaining_bytes_to_write -= DATA_BUFFER_SIZE;
-                                }else{
-                                    bytes_to_write = remaining_bytes_to_write;
-                                    remaining_bytes_to_write -= remaining_bytes_to_write;
-                                }
-
-                                bpf_probe_read_user(new_read_exit_data.read_data, bytes_to_write, existing_read_enter_data->buf_ptr);
-
-                                
-                                struct read_exit_data_t *existing_read_exit_data = bpf_map_lookup_elem(&pass_buf, &data_write_key); 
-
-                                //first time inserting into map don't need to get spinlock
-                                if(existing_read_exit_data == NULL){
-                                    
-                                    //insert into the data map
-                                    long error = bpf_map_update_elem(&data_map, &data_write_key, &new_read_exit_data, BPF_ANY);
-                                    bpf_printk("Error code for data_map insert = %ld\n", error);
-
-
-                                //the key exists so need to get spinlock in order to update it
-                                }else{
-
-                                    bool done_writing = false;
-
-                                    //atomically update the value
-                                    while(done_writing == false){
-                                        bpf_spin_lock(&existing_read_exit_data->lock);
-                                            if(existing_read_exit_data -> can_write){
-                                                long error = bpf_map_update_elem(&pass_buf, &data_write_key, &new_read_exit_data, BPF_ANY);
-                                                bpf_printk("Error code for data_map existing update = %ld\n", error);
-
-                                                done_writing = true;
-                                            }
-                                        bpf_spin_unlock(&existing_read_exit_data->lock);
-                                    }
-
-
-                                }
-
-                                //let user space know there is data in the hashmap
-                                //and give them the read key
-                                bpf_ringbuf_output(&output_read, &data_read_key, sizeof(data_read_key), 0);
-                                update_data_write_key();
-
-                                
-                            }
-
-                            //update this after the inner loop, because the multiple
-                            //writes to data_map are all from the same read
-                            update_pass_read_key();
-
-                            //break the outer while loop
-                            done_reading = true;
-                        }
-                    bpf_spin_unlock(&existing_read_enter_data->lock);
+                if(remaining_bytes_to_write < DATA_BUFFER_SIZE){
+                    write_amount = DATA_BUFFER_SIZE;
+                }else{
+                    write_amount = remaining_bytes_to_write;
                 }
 
 
+                bpf_probe_read_user(exit_dat.read_data, write_amount, existing_read_enter_data->buf_ptr);
+
+                bpf_printk("%s \n", exit_dat.read_data);
+
+                remaining_bytes_to_write -= write_amount;
+
             }
-            
+
+
         }
 
-
-
     }
-
        
 
     return 0;
 }
+
+
+
 
 
 

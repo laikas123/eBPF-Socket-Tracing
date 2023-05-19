@@ -46,7 +46,7 @@ int handle_event_socket(void *ctx, void *data, size_t data_sz)
 	const char* protocol_str = protocol_to_str(kern_data -> protocol);
 
 
-	if(kern_data -> domain == AF_BLUETOOTH){
+	if(kern_data -> uid == 490){
 		printf("pid = %d  uid = %d domain = %s type = %s protocol = %s\n", kern_data -> pid, kern_data -> uid, domain_str, type_str, protocol_str);
 	}
 
